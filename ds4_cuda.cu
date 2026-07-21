@@ -903,6 +903,7 @@ static uint64_t cuda_q8_f16_cache_reserve_bytes(uint64_t total_bytes) {
 
 static void cuda_q8_f16_cache_budget_notice(
         const char *reason,
+        const char *label,
         uint64_t request_bytes,
         uint64_t free_bytes,
         uint64_t total_bytes,
@@ -912,17 +913,19 @@ static void cuda_q8_f16_cache_budget_notice(
     g_q8_f16_budget_notice_printed = 1;
     if (limit_bytes != UINT64_MAX && free_bytes == 0 && total_bytes == 0 && reserve_bytes == 0) {
         fprintf(stderr,
-                "ds4: CUDA q8 fp16 cache %s; using q8 kernels "
+                "ds4: CUDA q8 fp16 cache %s for %s; using q8 kernels "
                 "(request=%.2f MiB cached=%.2f GiB limit=%.2f GiB)\n",
                 reason,
+                label ? label : "?",
                 (double)request_bytes / 1048576.0,
                 (double)g_q8_f16_bytes / 1073741824.0,
                 (double)limit_bytes / 1073741824.0);
     } else if (limit_bytes == UINT64_MAX) {
         fprintf(stderr,
-                "ds4: CUDA q8 fp16 cache %s; using q8 kernels "
+                "ds4: CUDA q8 fp16 cache %s for %s; using q8 kernels "
                 "(request=%.2f MiB cached=%.2f GiB free=%.2f GiB reserve=%.2f GiB total=%.2f GiB)\n",
                 reason,
+                label ? label : "?",
                 (double)request_bytes / 1048576.0,
                 (double)g_q8_f16_bytes / 1073741824.0,
                 (double)free_bytes / 1073741824.0,
@@ -930,9 +933,10 @@ static void cuda_q8_f16_cache_budget_notice(
                 (double)total_bytes / 1073741824.0);
     } else {
         fprintf(stderr,
-                "ds4: CUDA q8 fp16 cache %s; using q8 kernels "
+                "ds4: CUDA q8 fp16 cache %s for %s; using q8 kernels "
                 "(request=%.2f MiB cached=%.2f GiB limit=%.2f GiB free=%.2f GiB reserve=%.2f GiB total=%.2f GiB)\n",
                 reason,
+                label ? label : "?",
                 (double)request_bytes / 1048576.0,
                 (double)g_q8_f16_bytes / 1073741824.0,
                 (double)limit_bytes / 1073741824.0,
@@ -943,11 +947,11 @@ static void cuda_q8_f16_cache_budget_notice(
 }
 
 static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *label) {
-    (void)label;
     const uint64_t limit = cuda_q8_f16_cache_limit_bytes();
     if (limit == 0) return 0;
     if (g_q8_f16_bytes > limit || request_bytes > limit - g_q8_f16_bytes) {
-        cuda_q8_f16_cache_budget_notice("limit reached", request_bytes, 0, 0, 0, limit);
+        cuda_q8_f16_cache_budget_notice("limit reached", label,
+                                        request_bytes, 0, 0, 0, limit);
         return 0;
     }
 
@@ -966,7 +970,7 @@ static int cuda_q8_f16_cache_has_budget(uint64_t request_bytes, const char *labe
     const uint64_t reserve_bytes = cuda_q8_f16_cache_reserve_bytes(total_bytes);
     if (request_bytes > free_bytes ||
         free_bytes - request_bytes < reserve_bytes) {
-        cuda_q8_f16_cache_budget_notice("budget exhausted", request_bytes,
+        cuda_q8_f16_cache_budget_notice("budget exhausted", label, request_bytes,
                                         free_bytes, total_bytes,
                                         reserve_bytes, limit);
         return 0;
@@ -1178,8 +1182,8 @@ static const __half *cuda_q8_f16_ptr(
     }
     g_q8_f16_bytes += out_bytes;
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
-        fprintf(stderr, "ds4: CUDA cached q8 fp16 %.2f MiB on device %d (total %.2f GiB)\n",
-                (double)out_bytes / 1048576.0, expected_device,
+        fprintf(stderr, "ds4: CUDA cached q8 fp16 %s %.2f MiB on device %d (total %.2f GiB)\n",
+                label ? label : "?", (double)out_bytes / 1048576.0, expected_device,
                 (double)g_q8_f16_bytes / 1073741824.0);
     }
     if (g_n_gpus > 1 && prev >= 0) (void)cudaSetDevice(prev);
