@@ -609,12 +609,31 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
                 }
                 return dev_ptr;
             }
-            fprintf(stderr, "ds4: CUDA model range map pointer failed for %s: %s\n",
+            fprintf(stderr, "ds4: CUDA model range pointer lookup failed for %s: %s\n",
                     what ? what : "weights", cudaGetErrorString(err));
-            (void)cudaHostUnregister((void *)reg_addr);
+            cudaError_t rollback_err = cudaHostUnregister((void *)reg_addr);
+            if (rollback_err != cudaSuccess) {
+                fprintf(stderr,
+                        "ds4: CUDA model range registration rollback failed for %s: %s\n",
+                        what ? what : "weights", cudaGetErrorString(rollback_err));
+                g_model_ranges.push_back({model_map, offset, bytes, NULL,
+                                          (void *)reg_addr, NULL, reg_bytes, 1, 0});
+                return NULL;
+            }
             (void)cudaGetLastError();
         } else {
-            if (err == cudaErrorNotSupported || err == cudaErrorInvalidValue) g_model_range_mapping_supported = 0;
+            if (err == cudaErrorNotSupported) {
+                fprintf(stderr,
+                        "ds4: CUDA model range host-registration capability unavailable; "
+                        "using device cache\n");
+                g_model_range_mapping_supported = 0;
+            } else {
+                fprintf(stderr,
+                        "ds4: CUDA model range host registration failed for %s: %s; "
+                        "using device cache\n",
+                        what ? what : "weights", cudaGetErrorString(err));
+                if (err == cudaErrorInvalidValue) g_model_range_mapping_supported = 0;
+            }
             (void)cudaGetLastError();
         }
     }
@@ -1379,15 +1398,27 @@ static int cuda_model_prefetch_range(const void *model_map, uint64_t model_size,
     }
 
     int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess) {
+    cudaError_t err = cudaGetDevice(&device);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA model prefetch device query failed: %s\n",
+                cudaGetErrorString(err));
         (void)cudaGetLastError();
         return 0;
     }
 
     int pageable = 0;
-    cudaError_t err = cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, device);
-    if (err != cudaSuccess || !pageable) {
+    err = cudaDeviceGetAttribute(&pageable, cudaDevAttrPageableMemoryAccess, device);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA pageable-memory capability query failed on dev=%d: %s\n",
+                device, cudaGetErrorString(err));
         (void)cudaGetLastError();
+        return 0;
+    }
+    if (!pageable) {
+        fprintf(stderr,
+                "ds4: CUDA ATS/HMM prefetch capability unavailable on dev=%d; "
+                "using the configured model cache path\n",
+                device);
         return 0;
     }
 #if CUDART_VERSION >= 13000
