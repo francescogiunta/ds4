@@ -256,6 +256,7 @@ int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
 static uint64_t g_tensor_live_bytes;
 static uint64_t g_tensor_peak_bytes;
+static uint64_t g_cuda_init_used_bytes[DS4_MAX_GPUS];
 
 static void cuda_tensor_account_alloc(int device_id, uint64_t bytes) {
     if (device_id >= 0 && device_id < DS4_MAX_GPUS) {
@@ -2122,6 +2123,11 @@ static int cuda_report_device_capabilities(int device) {
             prop.name, prop.major, prop.minor, device,
             (double)free_bytes / 1073741824.0,
             (double)total_bytes / 1073741824.0);
+    if (device >= 0 && device < DS4_MAX_GPUS) {
+        g_cuda_init_used_bytes[device] = total_bytes >= free_bytes
+            ? total_bytes - free_bytes
+            : 0;
+    }
     fprintf(stderr,
             "ds4: CUDA capabilities dev=%d uva=%d managed=%d concurrent_managed=%d "
             "pageable=%d host_page_tables=%d hmm=%d direct_managed_host=%d "
@@ -2456,6 +2462,7 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_cache_full = 0;
     g_tensor_live_bytes = 0;
     g_tensor_peak_bytes = 0;
+    memset(g_cuda_init_used_bytes, 0, sizeof(g_cuda_init_used_bytes));
     if (g_model_prefetch_stream) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
@@ -4086,20 +4093,34 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
         ? g_model_registered_size
         : 0;
     const uint64_t external_used = total_b >= free_b ? total_b - free_b : 0;
+    int current_device = 0;
+    if (cudaGetDevice(&current_device) != cudaSuccess) {
+        (void)cudaGetLastError();
+        current_device = -1;
+    }
+    const uint64_t init_used =
+        current_device >= 0 && current_device < DS4_MAX_GPUS
+            ? g_cuda_init_used_bytes[current_device]
+            : 0;
+    const uint64_t process_delta = external_used >= init_used
+        ? external_used - init_used
+        : 0;
     const uint64_t tracked_device =
         arena_capacity + model_nonarena + full_model +
         g_q8_f16_bytes + g_q8_f32_bytes + device_cache +
         g_tensor_live_bytes + runtime_scratch + streaming_cache;
     const double accounting_delta_gib =
-        ((double)external_used - (double)tracked_device) / 1073741824.0;
+        ((double)process_delta - (double)tracked_device) / 1073741824.0;
 
     fprintf(stderr,
             "ds4: CUDA memory report %s: external used/free/total "
-            "%.2f/%.2f/%.2f GiB, tracked device %.2f GiB, delta %.2f GiB\n",
+            "%.2f/%.2f/%.2f GiB, process delta %.2f GiB, "
+            "tracked device %.2f GiB, residual %.2f GiB\n",
             label ? label : "",
             (double)external_used / 1073741824.0,
             (double)free_b / 1073741824.0,
             (double)total_b / 1073741824.0,
+            (double)process_delta / 1073741824.0,
             (double)tracked_device / 1073741824.0,
             accounting_delta_gib);
     fprintf(stderr,

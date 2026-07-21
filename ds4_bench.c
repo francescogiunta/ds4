@@ -3,6 +3,9 @@
 #include "ds4_distributed.h"
 #include "ds4_gpu_args.h"
 #include "ds4_help.h"
+#ifndef DS4_NO_GPU
+#include "ds4_gpu.h"
+#endif
 
 /* Purpose-built throughput benchmark.
  *
@@ -833,6 +836,15 @@ int main(int argc, char **argv) {
                 decode_metrics.measured_sec * 1000.0,
                 decode_metrics.measured_tps);
         fflush(out);
+
+#ifndef DS4_NO_GPU
+        if (getenv("DS4_CUDA_MEMORY_REPORT") != NULL) {
+            char memory_label[64];
+            snprintf(memory_label, sizeof(memory_label),
+                     "after benchmark frontier %d", frontier);
+            ds4_gpu_print_memory_report(memory_label);
+        }
+#endif
 
         previous = frontier;
         if (frontier >= cfg.ctx_max) break;
