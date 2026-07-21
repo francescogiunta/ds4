@@ -69,3 +69,11 @@ do not disable the host-availability floor on unified-memory systems. Existing
 artifacts are not overwritten unless `--overwrite` is passed explicitly. Run
 the synthetic guard tests with `make test-memory-guard`; they do not open a
 model.
+
+For CUDA allocation attribution, set `DS4_CUDA_MEMORY_REPORT=1`. The report
+keeps logical model bytes separate from arena capacity and prints Q8 caches,
+runtime tensor live/peak bytes, device-cache slabs, scratch/streaming capacity,
+pinned-host staging, and the delta from `cudaMemGetInfo`. The delta includes
+driver/runtime allocations and any CUDA allocation category not yet tracked;
+it must not be added to the external watchdog peak as if it were separate
+memory. Keep the external watchdog as the authoritative campaign gate.

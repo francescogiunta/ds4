@@ -2814,6 +2814,17 @@ static ds4_support_kind support_model_detect(
 }
 
 #ifndef DS4_NO_GPU
+static bool gpu_memory_report_enabled(void) {
+#if defined(__APPLE__)
+    return getenv("DS4_METAL_MEMORY_REPORT") != NULL;
+#elif defined(DS4_ROCM_BUILD)
+    return getenv("DS4_ROCM_MEMORY_REPORT") != NULL ||
+           getenv("DS4_METAL_MEMORY_REPORT") != NULL;
+#else
+    return getenv("DS4_CUDA_MEMORY_REPORT") != NULL;
+#endif
+}
+
 #ifndef __APPLE__
 typedef struct {
     uint64_t off;
@@ -3026,6 +3037,9 @@ static bool accelerator_cache_model_tensors(ds4_backend backend,
     fprintf(stderr,
             "ds4: %s startup model preparation covered %.2f GiB of tensor spans in %.3fs\n",
             accelerator_name, (double)prepared / 1073741824.0, t1 - t0);
+    if (gpu_memory_report_enabled()) {
+        ds4_gpu_print_memory_report("after model preload");
+    }
     return true;
 }
 #else
@@ -35050,7 +35064,7 @@ static int metal_graph_prompt_logits_test(
         fprintf(stderr, "ds4: failed to initialize Metal graph prompt test runtime\n");
         return 1;
     }
-    const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
+    const bool memory_report = gpu_memory_report_enabled();
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
 
     ds4_kv_cache cpu_cache;
@@ -46653,7 +46667,7 @@ static int generate_glm_metal_argmax(
         glm_graph_free(&g);
         return 1;
     }
-    const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
+    const bool memory_report = gpu_memory_report_enabled();
     if (memory_report) ds4_gpu_print_memory_report("after GLM graph alloc");
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));
@@ -46891,7 +46905,7 @@ static int generate_metal_graph_raw_swa(
         metal_graph_free(&g);
         return 1;
     }
-    const bool memory_report = getenv("DS4_METAL_MEMORY_REPORT") != NULL;
+    const bool memory_report = gpu_memory_report_enabled();
     if (memory_report) ds4_gpu_print_memory_report("after graph alloc");
 
     float *logits = xmalloc((size_t)DS4_N_VOCAB * sizeof(logits[0]));

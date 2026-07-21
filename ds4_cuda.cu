@@ -254,6 +254,34 @@ static_assert(DS4_MAX_GPUS == 16, "DS4_MAX_GPUS stack tables sized for 16");
 ds4_gpu_ctx g_gpu[DS4_MAX_GPUS];
 int         g_n_gpus = 0;
 int         g_gpu_peer_ok[DS4_MAX_GPUS][DS4_MAX_GPUS];
+static uint64_t g_tensor_live_bytes;
+static uint64_t g_tensor_peak_bytes;
+
+static void cuda_tensor_account_alloc(int device_id, uint64_t bytes) {
+    if (device_id >= 0 && device_id < DS4_MAX_GPUS) {
+        g_gpu[device_id].used_bytes += bytes;
+    }
+    if (g_tensor_live_bytes <= UINT64_MAX - bytes) {
+        g_tensor_live_bytes += bytes;
+    } else {
+        g_tensor_live_bytes = UINT64_MAX;
+    }
+    if (g_tensor_live_bytes > g_tensor_peak_bytes) {
+        g_tensor_peak_bytes = g_tensor_live_bytes;
+    }
+}
+
+static void cuda_tensor_account_free(int device_id, uint64_t bytes) {
+    if (device_id >= 0 && device_id < DS4_MAX_GPUS) {
+        g_gpu[device_id].used_bytes =
+            bytes <= g_gpu[device_id].used_bytes
+                ? g_gpu[device_id].used_bytes - bytes
+                : 0;
+    }
+    g_tensor_live_bytes = bytes <= g_tensor_live_bytes
+        ? g_tensor_live_bytes - bytes
+        : 0;
+}
 
 /* Per-pair pinned-host bounce buffers, indexed [src][dst]. Lazily grown
  * to the largest copy seen for that pair. Each pair is its own allocation
@@ -2426,6 +2454,8 @@ extern "C" void ds4_gpu_cleanup(void) {
     g_model_direct_align = 1;
     g_model_file_size = 0;
     g_model_cache_full = 0;
+    g_tensor_live_bytes = 0;
+    g_tensor_peak_bytes = 0;
     if (g_model_prefetch_stream) {
         (void)cudaStreamDestroy(g_model_prefetch_stream);
         g_model_prefetch_stream = NULL;
@@ -2447,7 +2477,7 @@ extern "C" int ds4_gpu_tensor_alloc_on(ds4_gpu_tensor *t, int device_id,
     t->bytes = bytes;
     t->owner = 1;
     t->device_id = device_id;
-    g_gpu[device_id].used_bytes += bytes;
+    cuda_tensor_account_alloc(device_id, bytes);
     return 0;
 }
 
@@ -2468,6 +2498,7 @@ extern "C" void ds4_gpu_tensor_free_in_place(ds4_gpu_tensor *t) {
     if (!t) return;
     int d = ds4_tensor_device_idx(t);
     if (t->owner && t->ptr) {
+        cuda_tensor_account_free(d, t->bytes);
         WITH_DEVICE(g_gpu[d].device_id) {
             (void)cudaFree(t->ptr);
         }
@@ -2502,6 +2533,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed(uint64_t bytes) {
     t->bytes = bytes;
     t->owner = 1;
     t->device_id = 0;
+    cuda_tensor_account_alloc(0, bytes);
     return t;
 }
 
@@ -2563,6 +2595,7 @@ extern "C" ds4_gpu_tensor *ds4_gpu_tensor_alloc_managed_on(int tier, uint64_t by
     t->bytes = bytes;
     t->owner = 1;
     t->device_id = tier;
+    cuda_tensor_account_alloc(tier, bytes);
     return t;
 }
 
@@ -2621,6 +2654,7 @@ extern "C" void ds4_gpu_tensor_free(ds4_gpu_tensor *tensor) {
     if (!tensor) return;
     int d = ds4_tensor_device_idx(tensor);
     if (tensor->owner && tensor->ptr) {
+        cuda_tensor_account_free(d, tensor->bytes);
         WITH_DEVICE(g_gpu[d].device_id) {
             (void)cudaFree(tensor->ptr);
         }
@@ -4012,9 +4046,82 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
 
 extern "C" void ds4_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
-    (void)cudaMemGetInfo(&free_b, &total_b);
-    fprintf(stderr, "ds4: CUDA memory report %s: free %.2f MiB total %.2f MiB\n",
-            label ? label : "", (double)free_b / 1048576.0, (double)total_b / 1048576.0);
+    cudaError_t err = cudaMemGetInfo(&free_b, &total_b);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA memory report %s failed: %s\n",
+                label ? label : "", cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return;
+    }
+
+    uint64_t arena_capacity = 0;
+    uint64_t arena_used = 0;
+    for (const cuda_model_arena &arena : g_model_arenas) {
+        arena_capacity += arena.bytes;
+        arena_used += arena.used;
+    }
+    uint64_t model_nonarena = 0;
+    for (const cuda_model_range &range : g_model_ranges) {
+        if (range.device_ptr && !range.host_registered && !range.arena_allocated) {
+            model_nonarena += range.bytes;
+        }
+    }
+    uint64_t device_cache = 0;
+    uint64_t runtime_scratch = g_cuda_tmp_bytes;
+    uint64_t host_pinned = 4u * g_model_stage_bytes +
+                           4u * g_stream_selected_stage_bytes;
+    for (int i = 0; i < g_n_gpus; i++) {
+        device_cache += g_dev_cache[i].bytes;
+        runtime_scratch += g_gpu[i].scratch_bytes;
+        for (int j = 0; j < g_n_gpus; j++) {
+            host_pinned += g_xdev_bounce_bytes[i][j];
+        }
+    }
+    const uint64_t streaming_cache =
+        g_stream_selected_cache.gate_capacity +
+        g_stream_selected_cache.up_capacity +
+        g_stream_selected_cache.down_capacity +
+        g_stream_selected_cache.slot_selected_capacity;
+    const uint64_t full_model = g_model_device_owned
+        ? g_model_registered_size
+        : 0;
+    const uint64_t external_used = total_b >= free_b ? total_b - free_b : 0;
+    const uint64_t tracked_device =
+        arena_capacity + model_nonarena + full_model +
+        g_q8_f16_bytes + g_q8_f32_bytes + device_cache +
+        g_tensor_live_bytes + runtime_scratch + streaming_cache;
+    const double accounting_delta_gib =
+        ((double)external_used - (double)tracked_device) / 1073741824.0;
+
+    fprintf(stderr,
+            "ds4: CUDA memory report %s: external used/free/total "
+            "%.2f/%.2f/%.2f GiB, tracked device %.2f GiB, delta %.2f GiB\n",
+            label ? label : "",
+            (double)external_used / 1073741824.0,
+            (double)free_b / 1073741824.0,
+            (double)total_b / 1073741824.0,
+            (double)tracked_device / 1073741824.0,
+            accounting_delta_gib);
+    fprintf(stderr,
+            "ds4: CUDA memory model logical/arena-used/arena-cap/nonarena/full "
+            "%.2f/%.2f/%.2f/%.2f/%.2f GiB; q8-f16/q8-f32 %.2f/%.2f GiB\n",
+            (double)g_model_range_bytes / 1073741824.0,
+            (double)arena_used / 1073741824.0,
+            (double)arena_capacity / 1073741824.0,
+            (double)model_nonarena / 1073741824.0,
+            (double)full_model / 1073741824.0,
+            (double)g_q8_f16_bytes / 1073741824.0,
+            (double)g_q8_f32_bytes / 1073741824.0);
+    fprintf(stderr,
+            "ds4: CUDA memory runtime tensors-live/peak %.2f/%.2f GiB; "
+            "device-cache/scratch/streaming %.2f/%.2f/%.2f GiB; "
+            "host-pinned %.2f GiB\n",
+            (double)g_tensor_live_bytes / 1073741824.0,
+            (double)g_tensor_peak_bytes / 1073741824.0,
+            (double)device_cache / 1073741824.0,
+            (double)runtime_scratch / 1073741824.0,
+            (double)streaming_cache / 1073741824.0,
+            (double)host_pinned / 1073741824.0);
 }
 
 extern "C" void ds4_gpu_set_quality(bool quality) {

@@ -127,6 +127,9 @@ int main(void) {
         (void)cudaSetDevice(0);
     }
 
+    if (getenv("DS4_CUDA_MEMORY_REPORT") != NULL) {
+        ds4_gpu_print_memory_report("model-cache test");
+    }
     ds4_gpu_cleanup();
     (void)cudaFreeHost(host);
     fprintf(stderr, "test_gpu_model_cache PASS (devs=%d)\n", dev_count);
