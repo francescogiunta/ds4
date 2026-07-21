@@ -4143,6 +4143,25 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
             (double)runtime_scratch / 1073741824.0,
             (double)streaming_cache / 1073741824.0,
             (double)host_pinned / 1073741824.0);
+    const uint64_t model_limit = cuda_model_cache_limit_bytes();
+    const uint64_t q8_f16_limit = cuda_q8_f16_cache_limit_bytes();
+    if (model_limit == UINT64_MAX && q8_f16_limit == UINT64_MAX) {
+        fprintf(stderr,
+                "ds4: CUDA memory limits model-cache=unlimited q8-f16=unlimited\n");
+    } else if (model_limit == UINT64_MAX) {
+        fprintf(stderr,
+                "ds4: CUDA memory limits model-cache=unlimited q8-f16=%.2f GiB\n",
+                (double)q8_f16_limit / 1073741824.0);
+    } else if (q8_f16_limit == UINT64_MAX) {
+        fprintf(stderr,
+                "ds4: CUDA memory limits model-cache=%.2f GiB q8-f16=unlimited\n",
+                (double)model_limit / 1073741824.0);
+    } else {
+        fprintf(stderr,
+                "ds4: CUDA memory limits model-cache=%.2f GiB q8-f16=%.2f GiB\n",
+                (double)model_limit / 1073741824.0,
+                (double)q8_f16_limit / 1073741824.0);
+    }
 }
 
 extern "C" void ds4_gpu_set_quality(bool quality) {
