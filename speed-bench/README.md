@@ -46,8 +46,9 @@ queries NVIDIA per-process accounting every second, tracks host `MemAvailable`,
 and writes both a CSV trace and a JSON summary. NVIDIA memory may be reported as
 unavailable on unified-memory systems; the host and process limits remain
 active. The defaults stop the run at 108 GB decimal group RSS/PSS, leaving a
-2 GB margin below the campaign's 110 GB hard cap, or when host available memory
-falls to 12 GiB:
+2 GB margin below the campaign's 110 GB hard cap. The same default cap is
+enforced against NVIDIA per-process memory when that metric is available. The
+guard also stops when host available memory falls to 12 GiB:
 
 ```
 python3 speed-bench/memory_guard.py \
