@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <time.h>
 
+extern int ds4_gpu_test_host_registration_rollback(void);
+
 static double monotonic_seconds(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -157,6 +159,10 @@ static int check_decode_attention_overflow_path(void) {
 }
 
 int main(void) {
+    if (!ds4_gpu_test_host_registration_rollback()) {
+        fprintf(stderr, "cuda-regression: host registration rollback failed\n");
+        return 1;
+    }
     if (!ds4_gpu_init()) return 1;
     int rc = check_large_topk();
     if (check_decode_attention_overflow_path() != 0) rc = 1;
