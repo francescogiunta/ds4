@@ -569,18 +569,23 @@ static int run_moe_handoff_pack(void) {
     CHECK(ds4_gpu_tensor_alloc_on(&weights, 0, weights_bytes) == 0, "moe_pack alloc weights");
     CHECK(ds4_gpu_tensor_alloc_on(&packed, 0, packed_bytes) == 0, "moe_pack alloc packed");
 
-    int ok = ds4_gpu_tensor_write(&norm, 0, host_norm, norm_bytes) &&
-             ds4_gpu_tensor_write(&selected, 0, host_selected, selected_bytes) &&
-             ds4_gpu_tensor_write(&weights, 0, host_weights, weights_bytes) &&
-             ds4_gpu_moe_handoff_pack_tensor(&packed, &norm, &selected, &weights,
-                                             n_embd, n_expert) &&
-             ds4_gpu_tensor_read(&packed, 0, host_packed, packed_bytes);
-    CHECK(ok, "moe_pack compute");
-    CHECK(memcmp(host_packed, host_norm, norm_bytes) == 0, "moe_pack norm");
-    CHECK(memcmp(host_packed + norm_bytes, host_selected, selected_bytes) == 0,
-          "moe_pack selected");
-    CHECK(memcmp(host_packed + norm_bytes + selected_bytes, host_weights, weights_bytes) == 0,
-          "moe_pack weights");
+    CHECK(ds4_gpu_tensor_write(&norm, 0, host_norm, norm_bytes) &&
+          ds4_gpu_tensor_write(&selected, 0, host_selected, selected_bytes) &&
+          ds4_gpu_tensor_write(&weights, 0, host_weights, weights_bytes),
+          "moe_pack input write");
+    for (int iteration = 0; iteration < 3; iteration++) {
+        memset(host_packed, 0, packed_bytes);
+        int ok = ds4_gpu_moe_handoff_pack_tensor(
+                     &packed, &norm, &selected, &weights, n_embd, n_expert) &&
+                 ds4_gpu_tensor_read(&packed, 0, host_packed, packed_bytes);
+        CHECK(ok, "moe_pack compute");
+        CHECK(memcmp(host_packed, host_norm, norm_bytes) == 0, "moe_pack norm");
+        CHECK(memcmp(host_packed + norm_bytes, host_selected, selected_bytes) == 0,
+              "moe_pack selected");
+        CHECK(memcmp(host_packed + norm_bytes + selected_bytes,
+                     host_weights, weights_bytes) == 0,
+              "moe_pack weights");
+    }
 
     ds4_gpu_tensor_free_in_place(&norm);
     ds4_gpu_tensor_free_in_place(&selected);
@@ -591,7 +596,7 @@ static int run_moe_handoff_pack(void) {
     free(host_weights);
     free(host_packed);
     ds4_gpu_cleanup();
-    fprintf(stderr, "  moe_handoff_pack OK\n");
+    fprintf(stderr, "  moe_handoff_pack OK (3 repeatable iterations)\n");
     return 0;
 }
 
