@@ -13,6 +13,7 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
 from pathlib import Path
 
 
@@ -68,6 +69,30 @@ class MemoryGuardUnitTests(unittest.TestCase):
         self.assertIsNone(value)
         self.assertEqual(status, "not_available")
 
+    def test_nvidia_limit(self):
+        process = memory_guard.ProcessMemory(
+            process_count=1,
+            rss_bytes=1 * memory_guard.MIB,
+            pss_bytes=1 * memory_guard.MIB,
+        )
+        host = memory_guard.HostMemory(
+            mem_total_bytes=128 * memory_guard.MIB,
+            mem_available_bytes=64 * memory_guard.MIB,
+            swap_free_bytes=0,
+        )
+        self.assertEqual(
+            memory_guard.limit_reason(
+                process,
+                host,
+                max_rss_bytes=100 * memory_guard.MIB,
+                max_pss_bytes=100 * memory_guard.MIB,
+                min_available_bytes=8 * memory_guard.MIB,
+                nvidia_bytes=101 * memory_guard.MIB,
+                max_nvidia_bytes=100 * memory_guard.MIB,
+            ),
+            "nvidia_process_memory",
+        )
+
 
 class MemoryGuardIntegrationTests(unittest.TestCase):
     def run_guard(self, directory: Path, extra: list[str], child: str):
@@ -108,6 +133,54 @@ class MemoryGuardIntegrationTests(unittest.TestCase):
         self.assertGreaterEqual(len(rows), 2)
         self.assertIsNone(summary["watchdog_trigger"])
         self.assertEqual(summary["child_exit_code"], 0)
+
+    def test_nvidia_limit_terminates_process_group(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            csv_path = directory / "trace.csv"
+            summary_path = directory / "summary.json"
+            parser = memory_guard.build_parser()
+            args = parser.parse_args(
+                [
+                    "--csv",
+                    str(csv_path),
+                    "--summary-json",
+                    str(summary_path),
+                    "--interval-ms",
+                    "25",
+                    "--pss-interval-ms",
+                    "25",
+                    "--nvidia-interval-ms",
+                    "25",
+                    "--max-rss-mib",
+                    "128",
+                    "--max-pss-mib",
+                    "128",
+                    "--max-nvidia-mib",
+                    "16",
+                    "--min-available-mib",
+                    "1",
+                    "--",
+                    sys.executable,
+                    "-c",
+                    "import time; time.sleep(5)",
+                ]
+            )
+            args.command = memory_guard.normalize_command(parser, args.command)
+            with mock.patch.object(
+                memory_guard,
+                "read_nvidia_memory",
+                return_value=(32 * memory_guard.MIB, "ok"),
+            ):
+                result = memory_guard.run(args)
+            summary = json.loads(summary_path.read_text(encoding="utf-8"))
+
+        self.assertEqual(result, memory_guard.WATCHDOG_EXIT)
+        self.assertEqual(summary["watchdog_trigger"], "nvidia_process_memory")
+        self.assertEqual(
+            summary["limits"]["max_nvidia_mib"],
+            16,
+        )
 
     def test_rss_limit_terminates_process_group(self):
         with tempfile.TemporaryDirectory() as temporary:

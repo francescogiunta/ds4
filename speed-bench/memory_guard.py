@@ -141,6 +141,8 @@ def limit_reason(
     max_rss_bytes: int,
     max_pss_bytes: int,
     min_available_bytes: int,
+    nvidia_bytes: int | None = None,
+    max_nvidia_bytes: int | None = None,
 ) -> str | None:
     if host.mem_available_bytes <= min_available_bytes:
         return "host_available"
@@ -148,6 +150,12 @@ def limit_reason(
         return "group_rss"
     if process.pss_bytes is not None and process.pss_bytes >= max_pss_bytes:
         return "group_pss"
+    if (
+        nvidia_bytes is not None
+        and max_nvidia_bytes is not None
+        and nvidia_bytes >= max_nvidia_bytes
+    ):
+        return "nvidia_process_memory"
     return None
 
 
@@ -244,6 +252,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--max-pss-mib", type=positive_int, default=DEFAULT_MAX_GROUP_MIB
+    )
+    parser.add_argument(
+        "--max-nvidia-mib", type=positive_int, default=DEFAULT_MAX_GROUP_MIB
     )
     parser.add_argument(
         "--min-available-mib",
@@ -373,6 +384,12 @@ def run(args: argparse.Namespace) -> int:
                 process.pss_bytes = last_pss
                 host = read_host_memory()
 
+                if not args.no_nvidia_smi and sample_started >= next_nvidia_at:
+                    last_nvidia, last_nvidia_status = read_nvidia_memory(pids)
+                    next_nvidia_at = (
+                        sample_started + args.nvidia_interval_ms / 1000.0
+                    )
+
                 max_rss = max(max_rss, process.rss_bytes)
                 if process.pss_bytes is not None:
                     max_pss = max(max_pss, process.pss_bytes)
@@ -401,6 +418,8 @@ def run(args: argparse.Namespace) -> int:
                         max_rss_bytes=args.max_rss_mib * MIB,
                         max_pss_bytes=args.max_pss_mib * MIB,
                         min_available_bytes=args.min_available_mib * MIB,
+                        nvidia_bytes=last_nvidia,
+                        max_nvidia_bytes=args.max_nvidia_mib * MIB,
                     )
                     if trigger is not None:
                         event = "watchdog_sigterm:" + trigger
@@ -424,6 +443,8 @@ def run(args: argparse.Namespace) -> int:
                         max_rss_bytes=args.max_rss_mib * MIB,
                         max_pss_bytes=args.max_pss_mib * MIB,
                         min_available_bytes=args.min_available_mib * MIB,
+                        nvidia_bytes=last_nvidia,
+                        max_nvidia_bytes=args.max_nvidia_mib * MIB,
                     )
                     if trigger is not None:
                         event = "watchdog_sigterm:" + trigger
@@ -435,18 +456,6 @@ def run(args: argparse.Namespace) -> int:
                             file=sys.stderr,
                             flush=True,
                         )
-
-                if not args.no_nvidia_smi and sample_started >= next_nvidia_at:
-                    last_nvidia, last_nvidia_status = read_nvidia_memory(pids)
-                    if last_nvidia is not None:
-                        max_nvidia = (
-                            last_nvidia
-                            if max_nvidia is None
-                            else max(max_nvidia, last_nvidia)
-                        )
-                    next_nvidia_at = (
-                        sample_started + args.nvidia_interval_ms / 1000.0
-                    )
                 if (
                     not sent_sigkill
                     and termination_started is not None
@@ -536,6 +545,7 @@ def run(args: argparse.Namespace) -> int:
         "limits": {
             "max_rss_mib": args.max_rss_mib,
             "max_pss_mib": args.max_pss_mib,
+            "max_nvidia_mib": args.max_nvidia_mib,
             "min_available_mib": args.min_available_mib,
             "grace_seconds": args.grace_seconds,
         },
