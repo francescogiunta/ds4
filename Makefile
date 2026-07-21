@@ -31,6 +31,7 @@ CFLAGS += -D_GNU_SOURCE -fno-finite-math-only
 CUDA_HOME ?= /usr/local/cuda
 NVCC ?= $(CUDA_HOME)/bin/nvcc
 CUDA_ARCH ?=
+CUDA_GB10_ARCH_FLAGS ?= -gencode=arch=compute_121,code=sm_121 -gencode=arch=compute_121,code=compute_121
 ifneq ($(strip $(CUDA_ARCH)),)
 NVCC_ARCH_FLAGS := -arch=$(CUDA_ARCH)
 endif
@@ -47,7 +48,7 @@ DS4_LINK_LIBS ?= $(CUDA_LDLIBS)
 METAL_LDLIBS := $(LDLIBS)
 endif
 
-.PHONY: all help clean test test-bench-metrics test-memory-guard test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-generic cuda-regression strix-halo rocm
+.PHONY: all help clean test test-bench-metrics test-memory-guard test-metal-session-batch test-cuda-session-batch test-cuda-mixed-batch dspark-acceptance dspark-verify-depth mtp-verify-depth cpu cuda cuda-spark cuda-spark-gb10 cuda-generic cuda-regression strix-halo rocm
 
 ifeq ($(UNAME_S),Darwin)
 all: ds4 ds4-server ds4-bench ds4-eval ds4-agent
@@ -102,7 +103,8 @@ all: help
 
 help:
 	@echo "DS4 build targets:"
-	@echo "  make cuda-spark          Build CUDA for DGX Spark / GB10"
+	@echo "  make cuda-spark-gb10     Build CUDA for GB10 (sm_121 cubin + PTX fallback)"
+	@echo "  make cuda-spark          Build the legacy DGX Spark CUDA profile"
 	@echo "  make cuda-generic        Build CUDA for a generic local CUDA GPU"
 	@echo "  make cuda CUDA_ARCH=sm_N Build CUDA with an explicit nvcc -arch value"
 	@echo "  make strix-halo          Build ROCm for Strix Halo / gfx1151"
@@ -115,6 +117,10 @@ help:
 
 cuda-spark:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=
+
+cuda-spark-gb10:
+	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent \
+		CUDA_ARCH= NVCC_ARCH_FLAGS="$(CUDA_GB10_ARCH_FLAGS)"
 
 cuda-generic:
 	$(MAKE) -B ds4 ds4-server ds4-bench ds4-eval ds4-agent CUDA_ARCH=native
