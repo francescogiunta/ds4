@@ -161,8 +161,11 @@ cpu: ds4_cli_cpu.o ds4_server_cpu.o ds4_bench_cpu.o ds4_bench_metrics.o ds4_eval
 	$(CC) $(CFLAGS) -o ds4-eval ds4_eval_cpu.o ds4_help.o $(CPU_CORE_OBJS) $(LDLIBS)
 	$(CC) $(CFLAGS) -o ds4-agent ds4_agent_cpu.o ds4_help.o ds4_web.o ds4_kvstore.o linenoise.o ds4_gpu_args_cpu.o $(CPU_CORE_OBJS) $(LDLIBS)
 
-cuda-regression: tests/cuda_long_context_smoke
+cuda-regression: tests/cuda_long_context_smoke tests/test_gpu_xdev tests/test_gpu_model_cache tests/test_gpu_lookup_cache_strict
 	./tests/cuda_long_context_smoke
+	./tests/test_gpu_xdev
+	./tests/test_gpu_model_cache
+	./tests/test_gpu_lookup_cache_strict
 endif
 
 ds4.o: ds4.c ds4.h ds4_ssd.h ds4_distributed.h ds4_gpu.h
