@@ -85,6 +85,17 @@ static const void *g_model_host_base;
 static const char *g_model_device_base;
 static uint64_t g_model_registered_size;
 static int g_model_registered;
+static int g_model_host_registration_owned;
+typedef cudaError_t (*cuda_host_unregister_fn)(void *);
+
+static cudaError_t cuda_host_registration_release_owned(
+        void *host, int *owned, cuda_host_unregister_fn unregister_fn) {
+    if (!owned || !*owned) return cudaSuccess;
+    cudaError_t err = unregister_fn(host);
+    if (err == cudaSuccess) *owned = 0;
+    return err;
+}
+
 static thread_local bool g_glm_mtp_verify_mode;
 static int g_model_device_owned;
 static int g_model_range_mapping_supported = 1;
@@ -2319,13 +2330,21 @@ extern "C" void ds4_gpu_cleanup(void) {
     if (g_model_device_owned && g_model_device_base) {
         (void)cudaFree((void *)g_model_device_base);
     }
-    if (g_model_registered && g_model_host_base) {
-        (void)cudaHostUnregister((void *)g_model_host_base);
+    if (g_model_host_registration_owned && g_model_host_base) {
+        cudaError_t err = cuda_host_registration_release_owned(
+                (void *)g_model_host_base, &g_model_host_registration_owned,
+                cudaHostUnregister);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA host registration cleanup failed: %s\n",
+                    cudaGetErrorString(err));
+            (void)cudaGetLastError();
+        }
     }
     g_model_host_base = NULL;
     g_model_device_base = NULL;
     g_model_registered_size = 0;
     g_model_registered = 0;
+    g_model_host_registration_owned = 0;
     g_model_device_owned = 0;
     g_model_range_mapping_supported = 1;
     g_model_hmm_direct = 0;
@@ -3125,9 +3144,133 @@ extern "C" int ds4_gpu_end_commands(void) {
 }
 extern "C" int ds4_gpu_synchronize(void) { return cuda_ok(cudaDeviceSynchronize(), "synchronize"); }
 
+typedef cudaError_t (*cuda_host_register_fn)(void *, size_t, unsigned int);
+typedef cudaError_t (*cuda_host_get_device_pointer_fn)(void **, void *, unsigned int);
+
+typedef struct {
+    cudaError_t register_error;
+    cudaError_t pointer_error;
+    cudaError_t rollback_error;
+    void       *device_ptr;
+    int         mapped;
+    int         registration_owned;
+} cuda_host_registration_result;
+
+static cuda_host_registration_result cuda_host_registration_try(
+        void *host,
+        size_t bytes,
+        cuda_host_register_fn register_fn,
+        cuda_host_get_device_pointer_fn pointer_fn,
+        cuda_host_unregister_fn unregister_fn) {
+    cuda_host_registration_result result = {};
+    result.register_error = register_fn(
+            host, bytes, cudaHostRegisterMapped | cudaHostRegisterReadOnly);
+    if (result.register_error != cudaSuccess) return result;
+
+    result.registration_owned = 1;
+    result.pointer_error = pointer_fn(&result.device_ptr, host, 0);
+    if (result.pointer_error == cudaSuccess && result.device_ptr) {
+        result.mapped = 1;
+        return result;
+    }
+    if (result.pointer_error == cudaSuccess) result.pointer_error = cudaErrorInvalidValue;
+
+    result.rollback_error = unregister_fn(host);
+    if (result.rollback_error == cudaSuccess) result.registration_owned = 0;
+    result.device_ptr = NULL;
+    return result;
+}
+
+static int cuda_model_host_registration_release(void) {
+    if (!g_model_host_registration_owned || !g_model_host_base) return 1;
+    cudaError_t err = cuda_host_registration_release_owned(
+            (void *)g_model_host_base, &g_model_host_registration_owned,
+            cudaHostUnregister);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA host registration cleanup failed: %s\n",
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_model_registered = 0;
+    return 1;
+}
+
+static int g_host_registration_test_register_calls;
+static int g_host_registration_test_pointer_calls;
+static int g_host_registration_test_unregister_calls;
+static cudaError_t g_host_registration_test_pointer_error;
+static cudaError_t g_host_registration_test_unregister_error;
+
+static cudaError_t cuda_host_registration_test_register(void *, size_t, unsigned int) {
+    g_host_registration_test_register_calls++;
+    return cudaSuccess;
+}
+
+static cudaError_t cuda_host_registration_test_pointer(void **dev, void *host, unsigned int) {
+    g_host_registration_test_pointer_calls++;
+    if (g_host_registration_test_pointer_error == cudaSuccess) *dev = host;
+    return g_host_registration_test_pointer_error;
+}
+
+static cudaError_t cuda_host_registration_test_unregister(void *) {
+    g_host_registration_test_unregister_calls++;
+    return g_host_registration_test_unregister_error;
+}
+
+extern "C" int ds4_gpu_test_host_registration_rollback(void) {
+    int host_value = 0;
+    g_host_registration_test_register_calls = 0;
+    g_host_registration_test_pointer_calls = 0;
+    g_host_registration_test_unregister_calls = 0;
+    g_host_registration_test_pointer_error = cudaErrorUnknown;
+    g_host_registration_test_unregister_error = cudaSuccess;
+    cuda_host_registration_result result = cuda_host_registration_try(
+            &host_value, sizeof(host_value),
+            cuda_host_registration_test_register,
+            cuda_host_registration_test_pointer,
+            cuda_host_registration_test_unregister);
+    if (result.mapped || result.registration_owned || result.device_ptr ||
+        result.pointer_error != cudaErrorUnknown ||
+        g_host_registration_test_register_calls != 1 ||
+        g_host_registration_test_pointer_calls != 1 ||
+        g_host_registration_test_unregister_calls != 1) {
+        return 0;
+    }
+
+    g_host_registration_test_unregister_error = cudaErrorUnknown;
+    result = cuda_host_registration_try(
+            &host_value, sizeof(host_value),
+            cuda_host_registration_test_register,
+            cuda_host_registration_test_pointer,
+            cuda_host_registration_test_unregister);
+    if (result.mapped || !result.registration_owned || result.device_ptr ||
+        result.rollback_error != cudaErrorUnknown ||
+        g_host_registration_test_register_calls != 2 ||
+        g_host_registration_test_pointer_calls != 2 ||
+        g_host_registration_test_unregister_calls != 2) {
+        return 0;
+    }
+
+    int owned = 1;
+    g_host_registration_test_unregister_error = cudaSuccess;
+    if (cuda_host_registration_release_owned(
+                &host_value, &owned,
+                cuda_host_registration_test_unregister) != cudaSuccess || owned ||
+        cuda_host_registration_release_owned(
+                &host_value, &owned,
+                cuda_host_registration_test_unregister) != cudaSuccess ||
+        g_host_registration_test_unregister_calls != 3) {
+        return 0;
+    }
+    return 1;
+}
+
 extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
-    if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
+    if (g_model_host_base == model_map && g_model_registered_size == model_size) {
+        return !g_model_host_registration_owned || g_model_registered;
+    }
     cuda_stream_selected_cache_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
@@ -3143,10 +3286,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         (void)cudaFree((void *)g_model_device_base);
         g_model_device_owned = 0;
     }
-    if (g_model_registered && g_model_host_base) {
-        (void)cudaHostUnregister((void *)g_model_host_base);
-        g_model_registered = 0;
-    }
+    if (!cuda_model_host_registration_release()) return 0;
     g_model_host_base = model_map;
     g_model_device_base = (const char *)model_map;
     g_model_registered_size = model_size;
@@ -3182,25 +3322,29 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         }
     }
 
-    cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
-                                       cudaHostRegisterMapped | cudaHostRegisterReadOnly);
-    if (err == cudaSuccess) {
-        void *dev = NULL;
-        err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
-        if (err == cudaSuccess && dev) {
-            g_model_device_base = (const char *)dev;
-            g_model_registered = 1;
-            fprintf(stderr, "ds4: CUDA registered %.2f GiB model mapping for device access\n",
-                    (double)model_size / 1073741824.0);
-        } else {
-            fprintf(stderr, "ds4: CUDA host registration pointer lookup failed: %s\n", cudaGetErrorString(err));
-            (void)cudaGetLastError();
+    cuda_host_registration_result registration = cuda_host_registration_try(
+            (void *)model_map, (size_t)model_size,
+            cudaHostRegister, cudaHostGetDevicePointer, cudaHostUnregister);
+    g_model_host_registration_owned = registration.registration_owned;
+    if (registration.mapped) {
+        g_model_device_base = (const char *)registration.device_ptr;
+        g_model_registered = 1;
+        fprintf(stderr, "ds4: CUDA registered %.2f GiB model mapping for device access\n",
+                (double)model_size / 1073741824.0);
+    } else if (registration.register_error == cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA host registration pointer lookup failed: %s\n",
+                cudaGetErrorString(registration.pointer_error));
+        if (registration.rollback_error != cudaSuccess) {
+            fprintf(stderr, "ds4: CUDA host registration rollback failed: %s\n",
+                    cudaGetErrorString(registration.rollback_error));
         }
+        (void)cudaGetLastError();
     } else {
-        fprintf(stderr, "ds4: CUDA host registration skipped: %s\n", cudaGetErrorString(err));
+        fprintf(stderr, "ds4: CUDA host registration skipped: %s\n",
+                cudaGetErrorString(registration.register_error));
         (void)cudaGetLastError();
     }
-    return 1;
+    return registration.rollback_error == cudaSuccess;
 }
 
 extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size, uint64_t max_tensor_bytes) {
@@ -3223,7 +3367,9 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
  * DS4_CUDA_COPY_MODEL branch that allocates and copies the entire model. */
 extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_t model_size) {
     if (!model_map || model_size == 0) return 0;
-    if (g_model_host_base == model_map && g_model_registered_size == model_size) return 1;
+    if (g_model_host_base == model_map && g_model_registered_size == model_size) {
+        return !g_model_host_registration_owned || g_model_registered;
+    }
 
     cuda_stream_selected_cache_release();
     cuda_model_range_release_all();
@@ -3240,10 +3386,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
         (void)cudaFree((void *)g_model_device_base);
         g_model_device_owned = 0;
     }
-    if (g_model_registered && g_model_host_base) {
-        (void)cudaHostUnregister((void *)g_model_host_base);
-        g_model_registered = 0;
-    }
+    if (!cuda_model_host_registration_release()) return 0;
     g_model_host_base = model_map;
     g_model_device_base = (const char *)model_map;
     g_model_registered_size = model_size;
@@ -3256,30 +3399,33 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
 
     /* No DS4_CUDA_COPY_MODEL branch — that is the entire point. */
 
-    cudaError_t err = cudaHostRegister((void *)model_map, (size_t)model_size,
-                                       cudaHostRegisterMapped | cudaHostRegisterReadOnly);
-    if (err == cudaSuccess) {
-        void *dev = NULL;
-        err = cudaHostGetDevicePointer(&dev, (void *)model_map, 0);
-        if (err == cudaSuccess && dev) {
-            g_model_device_base = (const char *)dev;
-            g_model_registered = 1;
+    cuda_host_registration_result registration = cuda_host_registration_try(
+            (void *)model_map, (size_t)model_size,
+            cudaHostRegister, cudaHostGetDevicePointer, cudaHostUnregister);
+    g_model_host_registration_owned = registration.registration_owned;
+    if (registration.mapped) {
+        g_model_device_base = (const char *)registration.device_ptr;
+        g_model_registered = 1;
+        fprintf(stderr,
+                "ds4: CUDA (no-copy) registered %.2f GiB model mapping for multi-tier selective cache\n",
+                (double)model_size / 1073741824.0);
+    } else if (registration.register_error == cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA (no-copy) host registration pointer lookup failed: %s\n",
+                cudaGetErrorString(registration.pointer_error));
+        if (registration.rollback_error != cudaSuccess) {
             fprintf(stderr,
-                    "ds4: CUDA (no-copy) registered %.2f GiB model mapping for multi-tier selective cache\n",
-                    (double)model_size / 1073741824.0);
-        } else {
-            fprintf(stderr,
-                    "ds4: CUDA (no-copy) host registration pointer lookup failed: %s\n",
-                    cudaGetErrorString(err));
-            (void)cudaGetLastError();
+                    "ds4: CUDA (no-copy) host registration rollback failed: %s\n",
+                    cudaGetErrorString(registration.rollback_error));
         }
+        (void)cudaGetLastError();
     } else {
         fprintf(stderr,
                 "ds4: CUDA (no-copy) host registration skipped: %s\n",
-                cudaGetErrorString(err));
+                cudaGetErrorString(registration.register_error));
         (void)cudaGetLastError();
     }
-    return 1;
+    return registration.rollback_error == cudaSuccess;
 }
 
 /* Set the current CUDA device by LOGICAL tier index (0..g_n_gpus-1).
