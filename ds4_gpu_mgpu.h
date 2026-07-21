@@ -85,6 +85,7 @@ typedef struct ds4_gpu_config {
 
 typedef struct {
     int    device_id;
+    int    sm_major;           /* CUDA compute-capability major, set at init */
     void  *stream;             /* cudaStream_t under CUDA */
     void  *cublas;             /* cublasHandle_t under CUDA */
     int    cublas_ready;
