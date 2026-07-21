@@ -2037,6 +2037,49 @@ static int cublas_ok(cublasStatus_t st, const char *what) {
     return 0;
 }
 
+static int cuda_report_device_capabilities(int device) {
+    cudaDeviceProp prop;
+    cudaError_t err = cudaGetDeviceProperties(&prop, device);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA device property query failed on dev=%d: %s\n",
+                device, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    size_t free_bytes = 0;
+    size_t total_bytes = 0;
+    err = cudaMemGetInfo(&free_bytes, &total_bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ds4: CUDA memory query failed on dev=%d: %s\n",
+                device, cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        return 0;
+    }
+
+    fprintf(stderr,
+            "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d "
+            "memory=%.2f/%.2f GiB free/total\n",
+            prop.name, prop.major, prop.minor, device,
+            (double)free_bytes / 1073741824.0,
+            (double)total_bytes / 1073741824.0);
+    fprintf(stderr,
+            "ds4: CUDA capabilities dev=%d uva=%d managed=%d concurrent_managed=%d "
+            "pageable=%d host_page_tables=%d hmm=%d direct_managed_host=%d "
+            "host_register=%d host_pointer_identity=%d\n",
+            device,
+            prop.unifiedAddressing,
+            prop.managedMemory,
+            prop.concurrentManagedAccess,
+            prop.pageableMemoryAccess,
+            prop.pageableMemoryAccessUsesHostPageTables,
+            prop.pageableMemoryAccess && prop.pageableMemoryAccessUsesHostPageTables,
+            prop.directManagedMemAccessFromHost,
+            prop.hostRegisterSupported,
+            prop.canUseHostPointerForRegisteredMem);
+    return 1;
+}
+
 extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
     if (!cfg || cfg->n_gpus < 1 || cfg->n_gpus > DS4_MAX_GPUS) return 0;
     cuda_xdev_env_refresh();
@@ -2059,11 +2102,7 @@ extern "C" int ds4_gpu_init_multi(const ds4_gpu_config *cfg) {
          * calls hit the right context. */
         g_n_gpus = i + 1;
         if (!cuda_ok(cudaSetDevice(c->device_id), "init set device")) return 0;
-        cudaDeviceProp prop;
-        if (cudaGetDeviceProperties(&prop, c->device_id) == cudaSuccess) {
-            fprintf(stderr, "ds4: CUDA backend initialized on %s (sm_%d%d) dev=%d\n",
-                    prop.name, prop.major, prop.minor, c->device_id);
-        }
+        if (!cuda_report_device_capabilities(c->device_id)) return 0;
         /* Per-device stream. */
         cudaStream_t s = NULL;
         if (!cuda_ok(cudaStreamCreate(&s), "init stream")) return 0;
