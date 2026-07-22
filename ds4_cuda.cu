@@ -396,6 +396,7 @@ struct cuda_model_range {
     uint64_t registered_bytes;
     int host_registered;
     int arena_allocated;
+    int host_direct;
 };
 
 struct cuda_model_arena {
@@ -629,7 +630,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             err = cudaHostGetDevicePointer(&reg_dev, (void *)reg_addr, 0);
             if (err == cudaSuccess && reg_dev) {
                 char *dev_ptr = (char *)reg_dev + reg_delta;
-                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0});
+                g_model_ranges.push_back({model_map, offset, bytes, dev_ptr, (void *)reg_addr, (char *)reg_dev, reg_bytes, 1, 0, 0});
                 g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
                 if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
                     fprintf(stderr, "ds4: CUDA mapped %s %.2f MiB\n",
@@ -646,7 +647,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
                         "ds4: CUDA model range registration rollback failed for %s: %s\n",
                         what ? what : "weights", cudaGetErrorString(rollback_err));
                 g_model_ranges.push_back({model_map, offset, bytes, NULL,
-                                          (void *)reg_addr, NULL, reg_bytes, 1, 0});
+                                          (void *)reg_addr, NULL, reg_bytes, 1, 0, 0});
                 return NULL;
             }
             (void)cudaGetLastError();
@@ -692,7 +693,7 @@ static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, 
             return NULL;
         }
     }
-    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0});
+    g_model_ranges.push_back({model_map, offset, bytes, (char *)dev, NULL, NULL, 0, 0, 0, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     if (getenv("DS4_CUDA_WEIGHT_CACHE_VERBOSE")) {
@@ -1832,6 +1833,7 @@ static uint64_t cuda_model_cache_limit_bytes(void) {
 }
 
 static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
+    if (getenv("DS4_CUDA_WEIGHT_ARENA_EXACT") != NULL) return need;
     uint64_t mb = 1792;
     const char *env = getenv("DS4_CUDA_WEIGHT_ARENA_CHUNK_MB");
     if (env && env[0]) {
@@ -1847,6 +1849,40 @@ static uint64_t cuda_model_arena_chunk_bytes(uint64_t need) {
         bytes = (need + align - 1u) & ~(align - 1u);
     }
     return bytes;
+}
+
+static uint64_t cuda_model_arena_capacity_bytes(void) {
+    uint64_t total = 0;
+    for (const cuda_model_arena &arena : g_model_arenas) {
+        if (arena.bytes > UINT64_MAX - total) return UINT64_MAX;
+        total += arena.bytes;
+    }
+    return total;
+}
+
+static uint64_t cuda_model_arena_chunk_with_limit(
+        uint64_t aligned, uint64_t preferred,
+        uint64_t capacity, uint64_t limit) {
+    if (capacity > limit || aligned > limit - capacity) return 0;
+    if (preferred < aligned) preferred = aligned;
+    const uint64_t remaining = limit - capacity;
+    return preferred > remaining ? aligned : preferred;
+}
+
+extern "C" int ds4_gpu_test_model_arena_budget(void) {
+    const uint64_t mib = 1048576ull;
+    const uint64_t gib = 1073741824ull;
+    return
+        cuda_model_arena_chunk_with_limit(256 * mib, 1792 * mib,
+                                          7 * gib, 8 * gib) == 256 * mib &&
+        cuda_model_arena_chunk_with_limit(256 * mib, 1792 * mib,
+                                          6 * gib, 8 * gib) == 1792 * mib &&
+        cuda_model_arena_chunk_with_limit(256 * mib, 1792 * mib,
+                                          8 * gib, 8 * gib) == 0 &&
+        cuda_model_arena_chunk_with_limit(512 * mib, 1792 * mib,
+                                          8 * gib - 256 * mib, 8 * gib) == 0 &&
+        cuda_model_arena_chunk_with_limit(512 * mib, 256 * mib,
+                                          0, UINT64_MAX) == 512 * mib;
 }
 
 static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
@@ -1865,9 +1901,14 @@ static char *cuda_model_arena_alloc(uint64_t bytes, const char *what) {
     }
 
     const uint64_t limit = cuda_model_cache_limit_bytes();
-    if (g_model_range_bytes > limit || aligned > limit - g_model_range_bytes) return NULL;
-
-    const uint64_t chunk = cuda_model_arena_chunk_bytes(aligned);
+    const uint64_t capacity = cuda_model_arena_capacity_bytes();
+    const uint64_t chunk = cuda_model_arena_chunk_with_limit(
+            aligned, cuda_model_arena_chunk_bytes(aligned), capacity, limit);
+    if (chunk == 0) return NULL;
+    /* The cache limit applies to bytes actually reserved by cudaMalloc, not
+     * only to logical tensor spans. If the preferred chunk would cross the
+     * boundary but this tensor still fits, trim the final arena to the exact
+     * aligned request instead of overshooting or abandoning the cache early. */
     void *dev = NULL;
     cudaError_t err = cudaMalloc(&dev, (size_t)chunk);
     if (err != cudaSuccess) {
@@ -1905,7 +1946,11 @@ static const char *cuda_model_range_ptr_from_fd(
                     (double)bytes / 1048576.0,
                     (double)limit / 1073741824.0);
         }
-        return cuda_model_ptr(model_map, offset);
+        char *host_ptr = (char *)cuda_model_ptr(model_map, offset);
+        g_model_ranges.push_back({model_map, offset, bytes, host_ptr,
+                                  NULL, NULL, 0, 0, 0, 1});
+        g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
+        return host_ptr;
     }
 
     char *dev = cuda_model_arena_alloc(bytes, what);
@@ -1973,7 +2018,7 @@ static const char *cuda_model_range_ptr_from_fd(
         return NULL;
     }
 
-    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1});
+    g_model_ranges.push_back({model_map, offset, bytes, dev, NULL, NULL, 0, 0, 1, 0});
     g_model_range_by_offset[offset] = g_model_ranges.size() - 1u;
     g_model_range_bytes += bytes;
     cuda_model_load_progress_note(g_model_range_bytes);
@@ -2077,7 +2122,7 @@ static void cuda_model_range_release_all(void) {
     for (const cuda_model_range &r : g_model_ranges) {
         if (r.host_registered && r.registered_base) {
             (void)cudaHostUnregister(r.registered_base);
-        } else if (r.device_ptr && !r.arena_allocated) {
+        } else if (r.device_ptr && !r.arena_allocated && !r.host_direct) {
             (void)cudaFree(r.device_ptr);
         }
     }
@@ -4070,7 +4115,8 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
     }
     uint64_t model_nonarena = 0;
     for (const cuda_model_range &range : g_model_ranges) {
-        if (range.device_ptr && !range.host_registered && !range.arena_allocated) {
+        if (range.device_ptr && !range.host_registered &&
+            !range.arena_allocated && !range.host_direct) {
             model_nonarena += range.bytes;
         }
     }

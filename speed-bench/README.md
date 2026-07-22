@@ -77,3 +77,27 @@ pinned-host staging, and the delta from `cudaMemGetInfo`. The delta includes
 driver/runtime allocations and any CUDA allocation category not yet tracked;
 it must not be added to the external watchdog peak as if it were separate
 memory. Keep the external watchdog as the authoritative campaign gate.
+
+### GB10 model-residency profiles
+
+The GB10 memory campaign uses exact-size model arenas to avoid multi-GiB slack:
+
+```sh
+export DS4_CUDA_WEIGHT_ARENA_EXACT=1
+```
+
+For the 80.76 GiB Q2 tensor set, keep the model cache unlimited and use the
+validated 10368 MiB Q8-to-F16 cache cap. For the 90.88 GiB Q2-Q4 tensor set,
+use the coordinated profile below; ranges beyond the 88 GiB model-cache limit
+remain in the mmap and are accessed through HMM/UVA instead of being treated as
+a preload failure:
+
+```sh
+export DS4_CUDA_WEIGHT_CACHE_LIMIT_GB=88
+export DS4_CUDA_Q8_F16_CACHE_MB=6144
+```
+
+The Q2-Q4 profile is the canonical 65K configuration. A 100K run fits only
+with a narrow margin below the campaign watchdog and should be reserved for an
+otherwise idle host. `DS4_CUDA_DIRECT_MODEL=1` is diagnostic only on GB10: it
+minimizes resident device memory but severely reduces prefill throughput.
