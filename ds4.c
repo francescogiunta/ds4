@@ -2841,6 +2841,11 @@ static int accelerator_tensor_span_cmp(const void *a, const void *b) {
     return 0;
 }
 
+static bool accelerator_tensor_name_eq(const ds4_tensor *t, const char *name) {
+    const size_t len = strlen(name);
+    return t && t->name.len == len && !memcmp(t->name.ptr, name, len);
+}
+
 static uint64_t accelerator_cuda_preload_span_bytes(void) {
     uint64_t mb = 1024;
 #ifndef DS4_ROCM_BUILD
@@ -2919,12 +2924,53 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
     qsort(spans, (size_t)nspan, sizeof(spans[0]), accelerator_tensor_span_cmp);
 
     const uint64_t max_span = accelerator_cuda_preload_span_bytes();
+    uint64_t merged = 0;
+    for (uint64_t i = 0; i < nspan;) {
+        const uint64_t off = spans[i].off;
+        uint64_t end = spans[i].end;
+        i++;
+        while (i < nspan &&
+               spans[i].off <= end + 65536u &&
+               spans[i].end - off <= max_span) {
+            if (spans[i].end > end) end = spans[i].end;
+            i++;
+        }
+        spans[merged++] = (accelerator_tensor_span){ .off = off, .end = end };
+    }
+
+#ifndef DS4_ROCM_BUILD
+    if (getenv("DS4_CUDA_WEIGHT_CACHE_OUTPUT_FIRST") != NULL) {
+        const ds4_tensor *output = NULL;
+        for (uint64_t i = 0; i < m->n_tensors; i++) {
+            if (accelerator_tensor_name_eq(&m->tensors[i], "output.weight")) {
+                output = &m->tensors[i];
+                break;
+            }
+        }
+        if (output) {
+            const uint64_t output_end = output->abs_offset + output->bytes;
+            for (uint64_t i = 0; i < merged; i++) {
+                if (output->abs_offset >= spans[i].off && output_end <= spans[i].end) {
+                    if (i != 0) {
+                        const accelerator_tensor_span priority = spans[i];
+                        memmove(&spans[1], &spans[0], (size_t)i * sizeof(spans[0]));
+                        spans[0] = priority;
+                    }
+                    fprintf(stderr,
+                            "ds4: CUDA weight cache prioritizing output span %.2f MiB\n",
+                            (double)(spans[0].end - spans[0].off) / 1048576.0);
+                    break;
+                }
+            }
+        }
+    }
+#endif
+
     const int tty = ds4_log_is_tty(stderr);
     const uint64_t progress_step = (tty ? 2ull : 16ull) * 1073741824ull;
     uint64_t next_progress = progress_step;
     double last_progress = now_sec();
     uint64_t prepared = 0;
-    uint64_t merged = 0;
 
 #ifdef DS4_ROCM_BUILD
     const char *accelerator_name = "ROCm";
@@ -2938,30 +2984,21 @@ static bool accelerator_prepare_model_tensor_spans(const ds4_model *m,
             tty ? ": 0.00 GiB" : "\n");
     fflush(stderr);
 
-    for (uint64_t i = 0; i < nspan;) {
-        uint64_t off = spans[i].off;
-        uint64_t end = spans[i].end;
-        i++;
-        while (i < nspan &&
-               spans[i].off <= end + 65536u &&
-               spans[i].end - off <= max_span) {
-            if (spans[i].end > end) end = spans[i].end;
-            i++;
-        }
+    for (uint64_t i = 0; i < merged; i++) {
+        const uint64_t off = spans[i].off;
+        const uint64_t end = spans[i].end;
         char label[96];
-        snprintf(label, sizeof(label), "tensor-span:%" PRIu64, merged);
+        snprintf(label, sizeof(label), "tensor-span:%" PRIu64, i);
         if (ds4_gpu_cache_model_range(m->map, m->size, off, end - off, label) == 0) {
             if (tty) fputc('\n', stderr);
             fprintf(stderr,
                     "ds4: accelerator failed to prepare model tensor span %" PRIu64
                     " at offset %" PRIu64 "\n",
-                    merged, off);
+                    i, off);
             free(spans);
             return false;
         }
         prepared += end - off;
-        merged++;
-
         const double now = now_sec();
         if (prepared >= next_progress || now - last_progress >= (tty ? 2.0 : 10.0)) {
             if (tty) {

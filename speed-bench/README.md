@@ -104,5 +104,18 @@ export DS4_CUDA_Q8_F16_CACHE_MB=6144
 The 90 GiB profile completed 100K at 109.991 GB decimal, only 8.6 MB below
 the watchdog, so that result is a demonstrated limit rather than an operational
 profile. Use 89 GiB for 100K and keep the host otherwise idle.
+
+For decode-heavy Q2-Q4 runs with a constrained model cache, the optional
+placement below loads the output matrix before the normal ascending spans:
+
+```sh
+export DS4_CUDA_WEIGHT_CACHE_OUTPUT_FIRST=1
+```
+
+It does not increase the cache budget. On GB10 at 90/6 it improved median 2K
+decode from 15.92 to 16.19 t/s, but reduced 65K prefill from 253.02 to 240.56
+t/s while decode rose from 12.55 to 12.64 t/s. Keep it disabled for canonical
+long-prefill runs; it is an explicit decode-heavy trade-off, not a default.
+
 `DS4_CUDA_DIRECT_MODEL=1` is diagnostic only on GB10: it
 minimizes resident device memory but severely reduces prefill throughput.
