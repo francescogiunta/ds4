@@ -27,6 +27,13 @@ SPEC.loader.exec_module(memory_guard)
 
 
 class MemoryGuardUnitTests(unittest.TestCase):
+    def test_campaign_defaults(self):
+        self.assertEqual(
+            memory_guard.DEFAULT_MAX_GROUP_MIB,
+            110_000_000_000 // memory_guard.MIB,
+        )
+        self.assertEqual(memory_guard.DEFAULT_MIN_AVAILABLE_MIB, 12 * 1024)
+
     def test_parse_kib_lines(self):
         values = memory_guard.parse_kib_lines(
             "MemTotal: 123 kB\nMemAvailable: 45 kB\nignored\n"
