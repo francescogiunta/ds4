@@ -12,6 +12,7 @@
 #include "ds4_gpu.h"
 
 #include <cuda_runtime.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -24,6 +25,26 @@
             return 1;                                                   \
         }                                                               \
     } while (0)
+
+typedef struct {
+    const void *model_map;
+    uint64_t model_size;
+    uint64_t offset;
+    uint64_t bytes;
+    int rc;
+    void *device_ptr;
+} promotion_thread_args;
+
+static void *promote_range_thread(void *ud) {
+    promotion_thread_args *a = ud;
+    a->rc = ds4_gpu_promote_model_range(a->model_map,
+                                        a->model_size,
+                                        a->offset,
+                                        a->bytes,
+                                        "synthetic-output",
+                                        &a->device_ptr);
+    return NULL;
+}
 
 int main(void) {
     int dev_count = 0;
@@ -53,6 +74,51 @@ int main(void) {
 
     CHECK(ds4_gpu_device_cache_tensors(0, ranges, 3) == 0,
           "device_cache_tensors dev 0 (3 ranges)");
+
+    /* Two simultaneous first-use requests must publish one immutable device
+     * copy. This models two sporadic sessions reaching decode together. */
+    promotion_thread_args promote[2];
+    pthread_t promote_threads[2];
+    memset(promote, 0, sizeof(promote));
+    for (int i = 0; i < 2; i++) {
+        promote[i].model_map = host;
+        promote[i].model_size = total;
+        promote[i].offset = 600 * 1024;
+        promote[i].bytes = 64 * 1024;
+        CHECK(pthread_create(&promote_threads[i], NULL,
+                             promote_range_thread, &promote[i]) == 0,
+              "promotion thread create");
+    }
+    for (int i = 0; i < 2; i++) {
+        CHECK(pthread_join(promote_threads[i], NULL) == 0,
+              "promotion thread join");
+        CHECK(promote[i].rc == 1, "concurrent promotion succeeds");
+        CHECK(promote[i].device_ptr != NULL,
+              "concurrent promotion returns pointer");
+    }
+    CHECK(promote[0].device_ptr == promote[1].device_ptr,
+          "concurrent promotion publishes one pointer");
+
+    unsigned char *promoted_copy = malloc(64 * 1024);
+    CHECK(promoted_copy != NULL, "promotion readback allocation");
+    CHECK(cudaMemcpy(promoted_copy, promote[0].device_ptr, 64 * 1024,
+                     cudaMemcpyDeviceToHost) == cudaSuccess,
+          "promotion readback");
+    CHECK(memcmp(promoted_copy, bytes + 600 * 1024, 64 * 1024) == 0,
+          "promoted bytes match source");
+
+    void *idempotent_ptr = NULL;
+    CHECK(ds4_gpu_promote_model_range(host, total, 600 * 1024, 64 * 1024,
+                                      "synthetic-output", &idempotent_ptr) == 1,
+          "promotion is idempotent");
+    CHECK(idempotent_ptr == promote[0].device_ptr,
+          "idempotent promotion keeps pointer");
+    void *second_ptr = NULL;
+    CHECK(ds4_gpu_promote_model_range(host, total, 700 * 1024, 32 * 1024,
+                                      "second-range", &second_ptr) == 0,
+          "second distinct promotion is rejected");
+    CHECK(second_ptr == NULL, "rejected promotion has no pointer");
+    free(promoted_copy);
 
     /* Base lookups + interior offset arithmetic. */
     int dev = -1; void *base0 = NULL, *interior0 = NULL;
@@ -130,6 +196,7 @@ int main(void) {
     if (getenv("DS4_CUDA_MEMORY_REPORT") != NULL) {
         ds4_gpu_print_memory_report("model-cache test");
     }
+    ds4_gpu_cleanup();
     ds4_gpu_cleanup();
     (void)cudaFreeHost(host);
     fprintf(stderr, "test_gpu_model_cache PASS (devs=%d)\n", dev_count);

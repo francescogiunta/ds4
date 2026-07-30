@@ -18,6 +18,8 @@
 #include <unordered_map>
 #include <vector>
 #include <algorithm>
+#include <atomic>
+#include <mutex>
 
 #ifndef M_PI
 #define M_PI 3.14159265358979323846
@@ -433,6 +435,13 @@ static std::unordered_map<uint64_t, size_t> g_q8_f16_by_offset;
 static std::vector<cuda_q8_f32_range> g_q8_f32_ranges;
 static std::unordered_map<uint64_t, size_t> g_q8_f32_by_offset;
 static uint64_t g_model_range_bytes;
+static std::atomic<char *> g_model_promoted_device_ptr{nullptr};
+static const void *g_model_promoted_host_base;
+static uint64_t g_model_promoted_offset;
+static uint64_t g_model_promoted_bytes;
+static int g_model_promoted_owned;
+static std::atomic<int> g_model_promotion_state{0};
+static std::mutex g_model_promotion_mutex;
 static uint64_t g_q8_f16_bytes;
 static uint64_t g_q8_f32_bytes;
 static int g_q8_cache_suppressed;
@@ -460,6 +469,7 @@ static const char *cuda_model_range_ptr_from_fd(
         uint64_t offset,
         uint64_t bytes,
         const char *what);
+static void cuda_model_promotion_release(void);
 
 /* Forward declaration: defined later in this file. The resolver wrapper
  * below uses it for multi-tier dispatch. */
@@ -579,8 +589,24 @@ static const char *cuda_model_ptr(const void *model_map, uint64_t offset) {
     return (const char *)model_map + offset;
 }
 
+static const char *cuda_model_promoted_ptr(
+        const void *model_map, uint64_t offset, uint64_t bytes) {
+    char *base = g_model_promoted_device_ptr.load(std::memory_order_acquire);
+    if (!base || model_map != g_model_promoted_host_base ||
+        offset < g_model_promoted_offset) {
+        return NULL;
+    }
+    const uint64_t delta = offset - g_model_promoted_offset;
+    if (delta > g_model_promoted_bytes || bytes > g_model_promoted_bytes - delta) {
+        return NULL;
+    }
+    return base + delta;
+}
+
 static const char *cuda_model_range_ptr(const void *model_map, uint64_t offset, uint64_t bytes, const char *what) {
     if (bytes == 0) return cuda_model_ptr(model_map, offset);
+    const char *promoted = cuda_model_promoted_ptr(model_map, offset, bytes);
+    if (promoted) return promoted;
     if (g_model_device_owned || g_model_registered) return cuda_model_ptr(model_map, offset);
     if (g_model_hmm_direct &&
         getenv("DS4_CUDA_WEIGHT_CACHE") == NULL &&
@@ -852,6 +878,19 @@ static int cuda_model_range_is_cached(const void *model_map, uint64_t offset, ui
         }
     }
     return 0;
+}
+
+static const char *cuda_model_range_cached_device_ptr(
+        const void *model_map, uint64_t offset, uint64_t bytes) {
+    const uint64_t end = offset + bytes;
+    if (end < offset) return NULL;
+    for (const cuda_model_range &r : g_model_ranges) {
+        if (r.host_base == model_map && r.device_ptr && !r.host_direct &&
+            offset >= r.offset && end <= r.offset + r.bytes) {
+            return r.device_ptr + (offset - r.offset);
+        }
+    }
+    return NULL;
 }
 
 static void cuda_q8_f16_cache_release_all(void) {
@@ -1820,6 +1859,110 @@ static int cuda_model_copy_to_device_streamed(
     return 1;
 }
 
+static void cuda_model_promotion_release(void) {
+    std::lock_guard<std::mutex> lock(g_model_promotion_mutex);
+    char *ptr = g_model_promoted_device_ptr.exchange(
+            nullptr, std::memory_order_acq_rel);
+    if (ptr && g_model_promoted_owned) (void)cudaFree(ptr);
+    g_model_promoted_host_base = NULL;
+    g_model_promoted_offset = 0;
+    g_model_promoted_bytes = 0;
+    g_model_promoted_owned = 0;
+    g_model_promotion_state.store(0, std::memory_order_release);
+}
+
+static void cuda_model_promotion_publish(
+        const void *model_map, uint64_t offset, uint64_t bytes,
+        char *device_ptr, int owned) {
+    g_model_promoted_host_base = model_map;
+    g_model_promoted_offset = offset;
+    g_model_promoted_bytes = bytes;
+    g_model_promoted_owned = owned;
+    g_model_promoted_device_ptr.store(device_ptr, std::memory_order_release);
+    g_model_promotion_state.store(2, std::memory_order_release);
+}
+
+extern "C" int ds4_gpu_promote_model_range(
+        const void *model_map,
+        uint64_t model_size,
+        uint64_t offset,
+        uint64_t bytes,
+        const char *label,
+        void **out_device_ptr) {
+    if (out_device_ptr) *out_device_ptr = NULL;
+    if (!model_map || bytes == 0 || offset > model_size ||
+        bytes > model_size - offset || model_map != g_model_host_base ||
+        model_size != g_model_registered_size || g_n_gpus != 1) {
+        return 0;
+    }
+
+    const char *existing = cuda_model_promoted_ptr(model_map, offset, bytes);
+    if (existing) {
+        if (out_device_ptr) *out_device_ptr = (void *)existing;
+        return 1;
+    }
+    if (g_model_promotion_state.load(std::memory_order_acquire) == 3) return 0;
+
+    std::lock_guard<std::mutex> lock(g_model_promotion_mutex);
+    existing = cuda_model_promoted_ptr(model_map, offset, bytes);
+    if (existing) {
+        if (out_device_ptr) *out_device_ptr = (void *)existing;
+        return 1;
+    }
+    if (g_model_promotion_state.load(std::memory_order_relaxed) != 0) return 0;
+    existing = cuda_model_range_cached_device_ptr(model_map, offset, bytes);
+    if (existing) {
+        cuda_model_promotion_publish(model_map, offset, bytes,
+                                     (char *)existing, 0);
+        if (out_device_ptr) *out_device_ptr = (void *)existing;
+        return 1;
+    }
+    if (g_model_device_owned) {
+        char *owned_model_ptr = (char *)g_model_device_base + offset;
+        cuda_model_promotion_publish(model_map, offset, bytes,
+                                     owned_model_ptr, 0);
+        if (out_device_ptr) *out_device_ptr = owned_model_ptr;
+        return 1;
+    }
+    g_model_promotion_state.store(1, std::memory_order_release);
+
+    char *dev = NULL;
+    cudaError_t err = cudaMalloc((void **)&dev, (size_t)bytes);
+    if (err != cudaSuccess) {
+        fprintf(stderr,
+                "ds4: CUDA phase promotion allocation failed for %s "
+                "(%.2f MiB): %s\n",
+                label ? label : "model range",
+                (double)bytes / 1048576.0,
+                cudaGetErrorString(err));
+        (void)cudaGetLastError();
+        g_model_promotion_state.store(3, std::memory_order_release);
+        return 0;
+    }
+
+    const double t0 = cuda_wall_sec();
+    if (!cuda_model_copy_to_device_streamed(
+                dev, model_map, model_size, offset, bytes,
+                label ? label : "phase-promoted model range")) {
+        if (g_stream_selected_upload_stream) {
+            (void)cudaStreamSynchronize(g_stream_selected_upload_stream);
+        }
+        (void)cudaFree(dev);
+        g_model_promotion_state.store(3, std::memory_order_release);
+        return 0;
+    }
+    const double elapsed = cuda_wall_sec() - t0;
+
+    cuda_model_promotion_publish(model_map, offset, bytes, dev, 1);
+    if (out_device_ptr) *out_device_ptr = dev;
+    fprintf(stderr,
+            "ds4: CUDA phase-promoted %s %.2f MiB in %.3f ms\n",
+            label ? label : "model range",
+            (double)bytes / 1048576.0,
+            elapsed * 1000.0);
+    return 1;
+}
+
 static uint64_t cuda_model_cache_limit_bytes(void) {
     uint64_t gb = 0;
     const char *env = getenv("DS4_CUDA_WEIGHT_CACHE_LIMIT_GB");
@@ -2446,6 +2589,7 @@ extern "C" void ds4_gpu_cleanup(void) {
 
     /* Continue with legacy global teardown below. */
 
+    cuda_model_promotion_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -3429,6 +3573,7 @@ extern "C" int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size)
         return !g_model_host_registration_owned || g_model_registered;
     }
     cuda_stream_selected_cache_release();
+    cuda_model_promotion_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -3529,6 +3674,7 @@ extern "C" int ds4_gpu_register_model_map_no_copy(const void *model_map, uint64_
     }
 
     cuda_stream_selected_cache_release();
+    cuda_model_promotion_release();
     cuda_model_range_release_all();
     cuda_q8_f16_cache_release_all();
     g_q8_f16_disabled_after_oom = 0;
@@ -4120,6 +4266,11 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
             model_nonarena += range.bytes;
         }
     }
+    const uint64_t model_promoted =
+        g_model_promoted_device_ptr.load(std::memory_order_acquire) &&
+        g_model_promoted_owned
+            ? g_model_promoted_bytes
+            : 0;
     uint64_t device_cache = 0;
     uint64_t runtime_scratch = g_cuda_tmp_bytes;
     uint64_t host_pinned = 4u * g_model_stage_bytes +
@@ -4153,7 +4304,7 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
         ? external_used - init_used
         : 0;
     const uint64_t tracked_device =
-        arena_capacity + model_nonarena + full_model +
+        arena_capacity + model_nonarena + model_promoted + full_model +
         g_q8_f16_bytes + g_q8_f32_bytes + device_cache +
         g_tensor_live_bytes + runtime_scratch + streaming_cache;
     const double accounting_delta_gib =
@@ -4180,6 +4331,9 @@ extern "C" void ds4_gpu_print_memory_report(const char *label) {
             (double)full_model / 1073741824.0,
             (double)g_q8_f16_bytes / 1073741824.0,
             (double)g_q8_f32_bytes / 1073741824.0);
+    fprintf(stderr,
+            "ds4: CUDA memory phase-promoted %.2f GiB\n",
+            (double)model_promoted / 1073741824.0);
     fprintf(stderr,
             "ds4: CUDA memory runtime tensors-live/peak %.2f/%.2f GiB; "
             "device-cache/scratch/streaming %.2f/%.2f/%.2f GiB; "

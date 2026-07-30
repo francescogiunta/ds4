@@ -59976,7 +59976,31 @@ static int ds4_session_eval_probe_tp(ds4_session *s, int token, bool probe_mtp,
     return rc;
 }
 
+#if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+static void ds4_session_maybe_promote_cuda_output(ds4_session *s) {
+    const char *enabled = getenv("DS4_CUDA_WEIGHT_CACHE_OUTPUT_PHASE_AWARE");
+    if (!enabled || !enabled[0] || !strcmp(enabled, "0") ||
+        !s || !s->engine || s->distributed || ds4_session_is_cpu(s) ||
+        ds4_session_is_glm(s) || s->engine->tp.active ||
+        s->engine->support_kind != DS4_SUPPORT_NONE ||
+        s->graph.ssd_streaming || !s->checkpoint_valid ||
+        !s->engine->weights.output) {
+        return;
+    }
+    const ds4_tensor *output = s->engine->weights.output;
+    (void)ds4_gpu_promote_model_range(s->engine->model.map,
+                                      s->engine->model.size,
+                                      output->abs_offset,
+                                      output->bytes,
+                                      "output.weight",
+                                      NULL);
+}
+#endif
+
 int ds4_session_eval(ds4_session *s, int token, char *err, size_t errlen) {
+#if !defined(DS4_NO_GPU) && !defined(DS4_ROCM_BUILD)
+    ds4_session_maybe_promote_cuda_output(s);
+#endif
     bool probe_mtp = true;
 #ifndef DS4_NO_GPU
     if (s && s->engine && s->engine->support_kind == DS4_SUPPORT_DSPARK) {

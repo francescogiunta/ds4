@@ -117,5 +117,20 @@ decode from 15.92 to 16.19 t/s, but reduced 65K prefill from 253.02 to 240.56
 t/s while decode rose from 12.55 to 12.64 t/s. Keep it disabled for canonical
 long-prefill runs; it is an explicit decode-heavy trade-off, not a default.
 
+The experimental phase-aware alternative preserves the normal ascending cache
+during prefill and copies `output.weight` to a separate device allocation on
+the first subsequent decode evaluation:
+
+```sh
+export DS4_CUDA_WEIGHT_CACHE_OUTPUT_PHASE_AWARE=1
+```
+
+It is CUDA single-device only, traditional decode only, and disabled by
+default. For the current Q2-Q4 file it adds about 536.56 MiB after prefill; use
+the memory guard and a 115 GB decimal ceiling. Until its model-backed quality,
+memory, and performance gates are recorded, treat it as an implementation
+candidate rather than an operational profile. Do not combine it with
+`DS4_CUDA_WEIGHT_CACHE_OUTPUT_FIRST`.
+
 `DS4_CUDA_DIRECT_MODEL=1` is diagnostic only on GB10: it
 minimizes resident device memory but severely reduces prefill throughput.
