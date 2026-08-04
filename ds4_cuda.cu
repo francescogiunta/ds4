@@ -516,6 +516,54 @@ static const char *cuda_derived_weight_ptr(
     return NULL;
 }
 
+static const cuda_derived_range *cuda_q8_aligned_artifact_find(
+        const void *model_map,
+        uint64_t source_offset,
+        uint64_t source_bytes,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    if (!model_map || source_bytes == 0 ||
+        !cuda_aligned_q8_enabled() ||
+        getenv("DS4_CUDA_NO_DERIVED_WEIGHTS") != NULL) {
+        return NULL;
+    }
+    for (const cuda_derived_range &r : g_derived_ranges) {
+        if (r.host_base == model_map &&
+            r.source_offset == source_offset &&
+            r.source_bytes == source_bytes &&
+            r.kind == CUDA_DERIVED_Q8_0_ALIGNED_DENSE &&
+            r.in_dim != 0 && r.out_dim != 0 &&
+            (!in_dim || (r.in_dim == in_dim && r.out_dim == out_dim)) &&
+            r.group_count == 1u && r.bytes != 0 && r.device_ptr) {
+            return &r;
+        }
+    }
+    return NULL;
+}
+
+static int cuda_q8_aligned_source_replaced(
+        const void *model_map,
+        uint64_t source_offset,
+        uint64_t source_bytes) {
+    return cuda_q8_aligned_artifact_find(
+        model_map, source_offset, source_bytes, 0, 0) != NULL;
+}
+
+static int cuda_q8_aligned_artifact_exact(
+        const void *model_map,
+        uint64_t source_offset,
+        uint64_t source_bytes,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    if ((in_dim % 1024u) != 0 || (out_dim % 128u) != 0) return 0;
+    const cuda_derived_range *r = cuda_q8_aligned_artifact_find(
+        model_map, source_offset, source_bytes, in_dim, out_dim);
+    if (!r) return 0;
+    const uint64_t artifact_bytes =
+        ds4_mmq_q8_0_aligned_bytes((int)out_dim, (int)in_dim);
+    return artifact_bytes != 0 && r->bytes >= artifact_bytes;
+}
+
 static int cuda_model_map_replaces_complete(const void *model_map) {
     return g_derived_replaces_complete && model_map == g_derived_replace_map;
 }
@@ -4478,6 +4526,7 @@ extern "C" int ds4_gpu_model_range_replaced(
         const void *model_map,
         uint64_t offset,
         uint64_t bytes) {
+    if (cuda_q8_aligned_source_replaced(model_map, offset, bytes)) return 1;
     if (!cuda_model_map_replaces_complete(model_map) || bytes == 0) return 0;
     for (const cuda_derived_range &range : g_derived_ranges) {
         if (range.host_base == model_map &&
@@ -4494,6 +4543,7 @@ extern "C" int ds4_gpu_model_range_replaced(
 extern "C" int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label) {
     if (!model_map || bytes == 0) return 1;
     if (offset > model_size || bytes > model_size - offset) return 0;
+    if (ds4_gpu_model_range_replaced(model_map, offset, bytes)) return 1;
     if (cuda_span_fully_replaced(model_map, offset, bytes)) return 1;
     if (!cuda_model_range_ptr(model_map, offset, bytes, label ? label : "model_tensor")) return 0;
     return cuda_model_range_is_cached(model_map, offset, bytes);
@@ -4515,11 +4565,62 @@ extern "C" int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_
         optional_q8_preload_disabled = 1;
         return 1;
     }
+    if (cuda_q8_aligned_artifact_exact(
+            model_map, offset, bytes, in_dim, out_dim)) {
+        return 1;
+    }
     if (!cuda_q8_f16_preload_allowed(cache_label, in_dim, out_dim)) return 1;
     if (cuda_q8_f16_ptr(model_map, offset, bytes, in_dim, out_dim, 0, cache_label)) return 1;
     optional_q8_preload_disabled = 1;
     return 1;
 }
+
+#ifdef DS4_CUDA_BACKEND_TEST_HOOKS
+extern "C" int ds4_gpu_test_add_q8_aligned_artifact(
+        const void *model_map,
+        uint64_t offset,
+        uint64_t source_bytes,
+        uint64_t in_dim,
+        uint64_t out_dim) {
+    if (!model_map || source_bytes == 0 ||
+        (in_dim % 1024u) != 0 || (out_dim % 128u) != 0) {
+        return 0;
+    }
+    const uint64_t artifact_bytes =
+        ds4_mmq_q8_0_aligned_bytes((int)out_dim, (int)in_dim);
+    if (artifact_bytes == 0) return 0;
+    void *device_ptr = NULL;
+    if (cudaMalloc(&device_ptr, (size_t)artifact_bytes) != cudaSuccess) {
+        (void)cudaGetLastError();
+        return 0;
+    }
+    g_derived_ranges.push_back({
+        model_map, offset, source_bytes,
+        CUDA_DERIVED_Q8_0_ALIGNED_DENSE,
+        in_dim, out_dim, 1u, artifact_bytes, (char *)device_ptr,
+    });
+    g_derived_artifact_bytes += artifact_bytes;
+    return 1;
+}
+
+extern "C" uint64_t ds4_gpu_test_model_range_count(void) {
+    return (uint64_t)g_model_ranges.size();
+}
+
+extern "C" uint64_t ds4_gpu_test_q8_f16_range_count(void) {
+    return (uint64_t)g_q8_f16_ranges.size();
+}
+
+extern "C" uint64_t ds4_gpu_test_derived_range_count(void) {
+    return (uint64_t)g_derived_ranges.size();
+}
+
+extern "C" const void *ds4_gpu_test_resolve_raw_range(
+        const void *model_map, uint64_t offset, uint64_t bytes) {
+    return cuda_resolve_weight_ptr(
+        model_map, offset, bytes, 0, "test raw lazy fallback");
+}
+#endif
 
 extern "C" void ds4_gpu_print_memory_report(const char *label) {
     size_t free_b = 0, total_b = 0;
