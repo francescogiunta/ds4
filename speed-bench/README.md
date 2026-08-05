@@ -11,8 +11,19 @@ Run `ds4-bench` as:
   --ctx-start 2048 \
   --ctx-max 65536 \
   --step-incr 2048 \
-  --gen-tokens 128
+  --gen-tokens 512 \
+  --gen-warmup-tokens 32
 ```
+
+`--gen-warmup-tokens` does not generate extra tokens. It appends warmup and
+post-warmup fields to the CSV while preserving the meaning and order of the
+existing columns. With the values above, `gen_measured_tps` covers the final
+480 tokens. The option defaults to 0.
+
+For the GB10 65K/100K campaign, use
+`tests/long_context_story_prompt_gb10.txt`. It is generated deterministically
+from the canonical fact-recall story by
+`tests/generate_gb10_long_context_fixture.py` and retains one final query.
 
 Provide PR including your numbers if your hardware was not already tested.
 Call the benchmark csv file something like `m3_max.csv` or alike, so that
