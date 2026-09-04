@@ -458,7 +458,7 @@ ds4_rocm_compat.o: ds4_rocm_compat.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_gpu_args.h
 ds4_rocm_unavailable.o: ds4_rocm_unavailable.cu
 	$(HIPCC) $(ROCM_CFLAGS) -c -o $@ ds4_rocm_unavailable.cu
 
-tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o $(MMQ_OBJS)
+tests/cuda_long_context_smoke: tests/cuda_long_context_smoke.o ds4_cuda.o ds4_image.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_layer_pack.o: tests/test_layer_pack.c ds4_layer_pack.h
@@ -504,7 +504,7 @@ ds4_cuda_backend_test_hooks.o: ds4_cuda.cu ds4_gpu.h ds4_gpu_mgpu.h ds4_iq2_tabl
 tests/test_gpu_derived_residency.o: tests/test_gpu_derived_residency.c ds4_gpu.h
 	$(CC) $(CFLAGS) -DDS4_CUDA_BACKEND_TEST_HOOKS -I. -I$(CUDA_HOME)/include -c -o $@ $<
 
-tests/test_gpu_derived_residency: tests/test_gpu_derived_residency.o ds4_cuda_backend_test_hooks.o $(MMQ_OBJS)
+tests/test_gpu_derived_residency: tests/test_gpu_derived_residency.o ds4_cuda_backend_test_hooks.o ds4_image.o $(MMQ_OBJS)
 	$(NVCC) $(NVCCFLAGS) -o $@ $^ $(CUDA_LDLIBS)
 
 tests/test_gpu_model_cache: tests/test_gpu_model_cache.o ds4_cuda.o $(MMQ_OBJS)
